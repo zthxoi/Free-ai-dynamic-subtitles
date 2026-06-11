@@ -2,111 +2,82 @@ import streamlit as st
 import os
 import subprocess
 import requests
-import time
 import pysrt
 
 # Настройки API
-# Используем самую мощную и быструю на сегодня модель whisper-large-v3-turbo
-API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 
-# Безопасно читаем токен из секретов Streamlit
-if "HF_TOKEN" in st.secrets:
-    headers = {"Authorization": f"Bearer {st.secrets['HF_TOKEN']}"}
-else:
-    st.error("Ошибка: Настройте HF_TOKEN в Secrets вашего Streamlit Cloud!")
+if not GROQ_API_KEY:
+    st.error("Ошибка: Добавьте GROQ_API_KEY в Secrets вашего Streamlit Cloud!")
     st.stop()
 
-def extract_audio(video_path, audio_path):
-    cmd = ['ffmpeg', '-y', '-i', video_path, '-q:a', '0', '-map', 'a', '-ar', '16000', audio_path]
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def extract_audio(video, audio):
+    # Сжимаем аудио в MP3 (моно, 16кГц, 64kbps) — это экономит трафик и идеально для API Groq
+    cmd = f'ffmpeg -y -i "{video}" -vn -ar 16000 -ac 1 -b:a 64k "{audio}"'
+    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def query_whisper_api(filename):
-    """Отправляет аудиофайл на сервера Hugging Face с защитой от сбоев сети"""
-    with open(filename, "rb") as f:
-        data = f.read()
+def query_groq_whisper(audio_path):
+    """Отправка аудиофайла напрямую в Groq Cloud API"""
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     
-    params = {"return_timestamps": "word"}
+    with open(audio_path, "rb") as f:
+        files = {
+            "file": (os.path.basename(audio_path), f, "audio/mp3")
+        }
+        data = {
+            "model": "whisper-large-v3",
+            "response_format": "verbose_json",  # Требуем подробный формат для пословных таймкодов
+            "temperature": "0.0"
+        }
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+        
+    if response.status_code != 200:
+        raise Exception(f"Groq API Error {response.status_code}: {response.text}")
+        
+    return response.json()
+
+def make_dynamic_srt(groq_words, srt_out, max_words):
+    file = pysrt.SubRipFile()
+    all_words = []
     
-    # Делаем 5 попыток пробить сеть, если сервер хостинга тупит
-    for attempt in range(1, 6):
-        try:
-            # Добавляем timeout=30, чтобы запрос не зависал намертво
-            response = requests.post(API_URL, headers=headers, data=data, params=params, timeout=30)
-            result = response.json()
-            
-            # Проверяем, не просыпается ли модель
-            if isinstance(result, dict) and "error" in result and "currently loading" in result["error"]:
-                st.warning(f"⏳ Модель Hugging Face просыпается... Ждем (попытка {attempt}/5)")
-                time.sleep(8)
-                continue
-                
-            return result
-            
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as net_err:
-            # Если упал DNS или моргнул интернет на хостинге — не падаем, а ждем и повторяем
-            if attempt == 5:
-                raise Exception(f"Сетевой сбой хостинга после 5 попыток: {net_err}")
-            time.sleep(3)  # Пауза перед следующей попыткой
+    # Парсим структуру, которую вернул Groq API
+    for w in groq_words:
+        if "word" not in w or not w["word"].strip():
             continue
+        all_words.append({
+            "text": w["word"].strip(), 
+            "start": w["start"], 
+            "end": w["end"]
+        })
             
-    raise Exception("Не удалось получить ответ от API.")
-
-def make_dynamic_srt(chunks, srt_path, max_words=2):
-    if not chunks:
-        return
+    sub_index = 1
+    for i in range(0, len(all_words), max_words):
+        group = all_words[i:i + max_words]
+        text_content = " ".join([w["text"] for w in group])
         
-    # Создаем пустой объект файла субтитров
-    srt = pysrt.SubRipFile()
-    index = 1
-    
-    for i in range(0, len(chunks), max_words):
-        group = chunks[i:i + max_words]
+        start_time = pysrt.SubRipTime(seconds=group[0]["start"])
+        end_time = pysrt.SubRipTime(seconds=group[-1]["end"])
         
-        text = " ".join([word_info.get("text", "").strip() for word_info in group])
-        if not text:
-            continue
+        if start_time == end_time:
+            end_time = pysrt.SubRipTime(seconds=group[-1]["end"] + 0.1)
             
-        try:
-            start_time = group[0]["timestamp"][0]
-            end_time = group[-1]["timestamp"][1]
-        except (KeyError, TypeError, IndexError):
-            continue
-            
-        if start_time is None or end_time is None:
-            continue
-
-        # Переводим секунды в строковый формат, который pysrt понимает идеально: "ЧЧ:ММ:СС,МММ"
-        def format_time(seconds):
-            hrs = int(seconds // 3600)
-            mins = int((seconds % 3600) // 60)
-            secs = int(seconds % 60)
-            msecs = int((seconds - int(seconds)) * 1000)
-            return f"{hrs:02d}:{mins:02d}:{secs:02d},{msecs:03d}"
-
-        # Создаем объект субтитра из обычной текстовой строки формата SRT
-        # Это избавляет нас от необходимости импортировать SubRipEvent и SubRipTime
-        srt_item_text = f"{index}\n{format_time(start_time)} --> {format_time(end_time)}\n{text}\n"
+        item = pysrt.SubRipItem(index=sub_index, start=start_time, end=end_time, text=text_content)
+        file.append(item)
+        sub_index += 1
         
-        # Парсим строку в объект и добавляем в файл
-        srt.append(pysrt.SubRipItem.from_string(srt_item_text))
-        index += 1
-        
-    srt.save(srt_path, encoding='utf-8')
+    file.save(srt_out, encoding='utf-8')
 
-def burn_subtitles(video_path, srt_path, output_path):
-    cmd = [
-        'ffmpeg', '-y', '-i', video_path,
-        '-vf', f"subtitles={srt_path}:force_style='FontName=Arial,FontSize=16,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=1.5,Shadow=0,Alignment=2'",
-        '-c:a', 'copy',
-        output_path
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise Exception(f"FFmpeg error: {result.stderr}")
+def burn_subtitles(video_in, srt_file, video_out):
+    style = "FontName=Arial,FontSize=16,Bold=1,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=1.5,Alignment=2"
+    srt_filter = srt_file.replace(":", "\\:")
+    cmd = f'ffmpeg -y -i "{video_in}" -vf "subtitles={srt_filter}:force_style=\'{style}\'" -c:a copy "{video_out}"'
+    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-# --- ИНТЕРФЕЙС STREAMLIT ---
-st.title("🎬 Автоматические динамические субтитры (Cloud API)")
-st.caption("Курсовой проект ПМИ. Обработка через Hugging Face Serverless Inference")
+# --- ИНТЕРФЕЙС ---
+st.set_page_config(page_title="SDVGH Subtitles Generator", layout="centered")
+st.title("Автоматический генератор субтитров")
+st.write("Вычисления запущены на облачных процессорах: **Groq LPU (Whisper Large V3)**")
 
 st.sidebar.header("Настройки субтитров")
 max_words = st.sidebar.slider("Макс. слов на экране", min_value=1, max_value=5, value=2)
@@ -121,48 +92,45 @@ if uploaded_file is not None:
     st.video(input_path) 
     
     if st.button("Сгенерировать субтитры"):
-        audio_path = "user_temp_audio.wav"
+        audio_path = "user_temp_audio.mp3"  # Перевели на mp3
         srt_path = "user_subtitles.srt"
         output_path = "user_output_subs.mp4"
         
-        with st.spinner("Отправляем аудио на сервера Hugging Face, распознаем и вжигаем идеальные сабы..."):
+        with st.spinner("Вытаскиваем звук, отправляем в облако Groq и вжигаем сабы..."):
             try:
-                # 1. Извлекаем звук локально
+                # 1. Сжимаем и вытаскиваем аудиодорожку
                 extract_audio(input_path, audio_path)
                 
-                # 2. Отправляем в облако HF
-                api_result = query_whisper_api(audio_path)
+                # 2. Быстро распознаем через API
+                api_result = query_groq_whisper(audio_path)
+                words = api_result.get("words", [])
                 
-                if "chunks" not in api_result:
-                    # Если API вернул просто текст, а не чанки с таймкодами
-                    if "text" in api_result:
-                        st.warning("Модель вернула сплошной текст без тайм-кодов слов. Возможно, аудио слишком короткое.")
-                    else:
-                        raise Exception(f"Некорректный ответ API: {api_result}")
+                # Запасной фолбэк, если Groq сгруппировал только по сегментам
+                if not words and "segments" in api_result:
+                    words = [{"word": seg.get("text"), "start": seg.get("start"), "end": seg.get("end")} for seg in api_result["segments"]]
                 
-                # 3. Собираем SRT локально
-                chunks = api_result.get("chunks", [])
-                make_dynamic_srt(chunks, srt_path, max_words)
+                # 3. Собираем структуру через pysrt
+                make_dynamic_srt(words, srt_path, max_words)
                 
-                # 4. Вжигаем субтитры через локальный FFmpeg
+                # 4. Вжигаем субтитры
                 burn_subtitles(input_path, srt_path, output_path)
                 
-                st.success("Видео успешно обработано с максимальным качеством!")
+                st.success("Видео успешно обработано!")
                 st.video(output_path) 
                 
                 with open(output_path, "rb") as file:
                     st.download_button(
                         label="🎬 Скачать готовое видео",
                         data=file,
-                        file_name="dynamic_subtitles_large.mp4",
+                        file_name="sdvh_subtitles.mp4",
                         mime="video/mp4"
                     )
                     
             except Exception as e:
-                st.error(f"Произошла ошибка: {e}")
+                st.error(f"Произошла ошибка обработки: {e}")
                 
             finally:
-                # Чистим мусор
+                # Чистим сервер за собой
                 for path in [audio_path, srt_path, input_path, output_path]:
                     if os.path.exists(path):
                         try: os.remove(path)
