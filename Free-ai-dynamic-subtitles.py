@@ -76,6 +76,7 @@ if uploaded_file is not None:
     st.video(input_path) 
     
     if st.button("Сгенерировать субтитры"):
+        global pipe  
         audio_path = "user_temp_audio.wav"
         srt_path = "user_subtitles.srt"
         output_path = "user_output_subs.mp4"
@@ -89,7 +90,6 @@ if uploaded_file is not None:
                 make_dynamic_srt(result["chunks"], srt_path, max_words)
                 
                 import gc
-                global pipe
                 del pipe
                 gc.collect() 
                 
