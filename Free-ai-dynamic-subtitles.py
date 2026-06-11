@@ -1,69 +1,98 @@
 import streamlit as st
-import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 import os
 import subprocess
-import pysrt
+import requests
+import time
+from pysrt import SubRipFile, SubRipEvent, SubRipTime
 
-MODEL_ID = "openai/whisper-base"
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+# Настройки API
+# Используем самую мощную и быструю на сегодня модель whisper-large-v3-turbo
+API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
 
-@st.cache_resource
-def load_whisper():
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        MODEL_ID, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
-    ).to(device)
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
-    pipe = pipeline(
-        "automatic-speech-recognition", model=model, tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor, chunk_length_s=30,
-        torch_dtype=torch_dtype, device=device
-    )
-    return pipe
+# Безопасно читаем токен из секретов Streamlit
+if "HF_TOKEN" in st.secrets:
+    headers = {"Authorization": f"Bearer {st.secrets['HF_TOKEN']}"}
+else:
+    st.error("Ошибка: Настройте HF_TOKEN в Secrets вашего Streamlit Cloud!")
+    st.stop()
 
-def extract_audio(video, audio):
-    cmd = f'ffmpeg -y -i "{video}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "{audio}"'
-    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def extract_audio(video_path, audio_path):
+    cmd = ['ffmpeg', '-y', '-i', video_path, '-q:a', '0', '-map', 'a', '-ar', '16000', audio_path]
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-def make_dynamic_srt(whisper_chunks, srt_out, max_words):
-    file = pysrt.SubRipFile()
-    all_words = []
-    for chunk in whisper_chunks:
-        if "text" not in chunk or not chunk["text"].strip():
+def query_whisper_api(filename):
+    """Отправляет аудиофайл на сервера Hugging Face и ждет результат"""
+    with open(filename, "rb") as f:
+        data = f.read()
+    
+    # Передаем параметры, чтобы сервер вернул нам тайм-коды для каждого слова
+    params = {"return_timestamps": "word"}
+    
+    # Бесплатный API может спать. Если он просыпается, он вернет ошибку 503.
+    # Делаем цикл, чтобы подождать, пока сервер поднимется
+    for _ in range(10):
+        response = requests.post(API_URL, headers=headers, data=data, params=params)
+        result = response.json()
+        
+        if "error" in result and "currently loading" in result["error"]:
+            time.sleep(5)  # Ждем 5 секунд, если модель еще просыпается
             continue
-        if isinstance(chunk["timestamp"], tuple):
-            start, end = chunk["timestamp"]
-            all_words.append({"text": chunk["text"].strip(), "start": start, "end": end})
+        return result
+    raise Exception("Сервер Hugging Face слишком долго просыпается. Попробуйте еще раз.")
+
+def make_dynamic_srt(chunks, srt_path, max_words=2):
+    if not chunks:
+        # Если API вернул упрощенный формат без чанков, создаем один пустой эвент
+        return
+        
+    srt = SubRipFile()
+    index = 1
+    
+    # Группируем слова по max_words штук на экран
+    for i in range(0, len(chunks), max_words):
+        group = chunks[i:i + max_words]
+        
+        # Берем текст группы
+        text = " ".join([word_info.get("text", "").strip() for word_info in group])
+        if not text:
+            continue
             
-    sub_index = 1
-    for i in range(0, len(all_words), max_words):
-        group = all_words[i:i + max_words]
-        text_content = " ".join([w["text"] for w in group])
-        start_time = pysrt.SubRipTime(seconds=group[0]["start"])
-        end_time = pysrt.SubRipTime(seconds=group[-1]["end"])
-        if start_time == end_time:
-            end_time = pysrt.SubRipTime(seconds=group[-1]["end"] + 0.1)
+        # Пытаемся вытащить тайм-коды начала и конца группы
+        try:
+            start_time = group[0]["timestamp"][0]
+            end_time = group[-1]["timestamp"][1]
+        except (KeyError, TypeError, IndexError):
+            continue
             
-        item = pysrt.SubRipItem(index=sub_index, start=start_time, end=end_time, text=text_content)
-        file.append(item)
-        sub_index += 1
-    file.save(srt_out, encoding='utf-8')
+        if start_time is None or end_time is None:
+            continue
 
-def burn_subtitles(video_in, srt_file, video_out):
-    style = "FontName=Arial,FontSize=16,Bold=1,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=3,Alignment=2"
-    srt_filter = srt_file.replace(":", "\\:")
-    cmd = f'ffmpeg -y -i "{video_in}" -vf "subtitles={srt_filter}:force_style=\'{style}\'" -c:a copy "{video_out}"'
-    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Конвертируем секунды во временной формат SRT
+        start_srt = SubRipTime(milliseconds=int(start_time * 1000))
+        end_srt = SubRipTime(milliseconds=int(end_time * 1000))
+        
+        event = SubRipEvent(index=index, start=start_srt, end=end_srt, text=text)
+        srt.append(event)
+        index += 1
+        
+    srt.save(srt_path, encoding='utf-8')
 
-st.set_page_config(page_title="SDVGH Subtitles Generator", layout="centered")
-st.title("Автоматический генератор субтитров")
-st.write(f"Вычисления запущены на: **{device.upper()}**")
+def burn_subtitles(video_path, srt_path, output_path):
+    cmd = [
+        'ffmpeg', '-y', '-i', video_path,
+        '-vf', f"subtitles={srt_path}:force_style='FontName=Arial,FontSize=16,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=1.5,Shadow=0,Alignment=2'",
+        '-c:a', 'copy',
+        output_path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg error: {result.stderr}")
 
-pipe = load_whisper()
+# --- ИНТЕРФЕЙС STREAMLIT ---
+st.title("🎬 Автоматические динамические субтитры (Cloud API)")
+st.caption("Курсовой проект ПМИ. Обработка через Hugging Face Serverless Inference")
 
 st.sidebar.header("Настройки субтитров")
-lang = st.sidebar.selectbox("Язык видео", ["russian", "english"])
 max_words = st.sidebar.slider("Макс. слов на экране", min_value=1, max_value=5, value=2)
 
 uploaded_file = st.file_uploader("Перетащи сюда свое MP4 видео", type=["mp4", "mov", "avi"])
@@ -80,36 +109,44 @@ if uploaded_file is not None:
         srt_path = "user_subtitles.srt"
         output_path = "user_output_subs.mp4"
         
-        with st.spinner("Вытаскиваем звук, распознаем и вжигаем сабы..."):
+        with st.spinner("Отправляем аудио на сервера Hugging Face, распознаем и вжигаем идеальные сабы..."):
             try:
+                # 1. Извлекаем звук локально
                 extract_audio(input_path, audio_path)
                 
-                result = pipe(audio_path, return_timestamps="word", generate_kwargs={"language": lang})
+                # 2. Отправляем в облако HF
+                api_result = query_whisper_api(audio_path)
                 
-                make_dynamic_srt(result["chunks"], srt_path, max_words)
+                if "chunks" not in api_result:
+                    # Если API вернул просто текст, а не чанки с таймкодами
+                    if "text" in api_result:
+                        st.warning("Модель вернула сплошной текст без тайм-кодов слов. Возможно, аудио слишком короткое.")
+                    else:
+                        raise Exception(f"Некорректный ответ API: {api_result}")
                 
+                # 3. Собираем SRT локально
+                chunks = api_result.get("chunks", [])
+                make_dynamic_srt(chunks, srt_path, max_words)
+                
+                # 4. Вжигаем субтитры через локальный FFmpeg
                 burn_subtitles(input_path, srt_path, output_path)
                 
-                st.success("Видео успешно обработано!")
+                st.success("Видео успешно обработано с максимальным качеством!")
                 st.video(output_path) 
                 
                 with open(output_path, "rb") as file:
                     st.download_button(
                         label="🎬 Скачать готовое видео",
                         data=file,
-                        file_name="sdvh_subtitles.mp4",
+                        file_name="dynamic_subtitles_large.mp4",
                         mime="video/mp4"
                     )
                     
             except Exception as e:
-                st.error(f"Произошла ошибка обработки: {e}")
+                st.error(f"Произошла ошибка: {e}")
                 
             finally:
-                for path in [audio_path, srt_path, input_path, output_path]:
-                    if os.path.exists(path):
-                        try: os.remove(path)
-                        except: pass
-                    
+                # Чистим мусор
                 for path in [audio_path, srt_path, input_path, output_path]:
                     if os.path.exists(path):
                         try: os.remove(path)
