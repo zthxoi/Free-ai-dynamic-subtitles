@@ -12,7 +12,6 @@ if not GROQ_API_KEY:
     st.stop()
 
 def extract_audio(video, audio):
-    # Сжимаем аудио в MP3 (моно, 16кГц, 64kbps) — это экономит трафик и идеально для API Groq
     cmd = f'ffmpeg -y -i "{video}" -vn -ar 16000 -ac 1 -b:a 64k "{audio}"'
     subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -28,7 +27,7 @@ def query_groq_whisper(audio_path):
         data = {
             "model": "whisper-large-v3",
             "response_format": "verbose_json",
-            "timestamp_granularities[]": "word",# Требуем подробный формат для пословных таймкодов
+            "timestamp_granularities[]": "word",
             "temperature": "0.0"
         }
         response = requests.post(url, headers=headers, files=files, data=data, timeout=60)
@@ -42,9 +41,7 @@ def make_dynamic_srt(groq_words, srt_out, max_words):
     file = pysrt.SubRipFile()
     all_words = []
     
-    # 1. Собираем ВСЕ отдельные слова в плоский список
     for w in groq_words:
-        # Groq в verbose_json для каждого слова возвращает ключ "word"
         if "word" not in w or not w["word"].strip():
             continue
         all_words.append({
@@ -57,21 +54,17 @@ def make_dynamic_srt(groq_words, srt_out, max_words):
         return False
 
     sub_index = 1
-    # 2. Нарезаем этот список строго по max_words (из ползунка Streamlit)
     for i in range(0, len(all_words), max_words):
         group = all_words[i:i + max_words]
         
-        # Склеиваем слова текущей группы через пробел
         text_content = " ".join([w["text"] for w in group])
         
-        # Берем время начала ПЕРВОГО слова в группе и конца ПОСЛЕДНЕГО слова
         start_time = pysrt.SubRipTime(seconds=group[0]["start"])
         end_time = pysrt.SubRipTime(seconds=group[-1]["end"])
         
         if start_time == end_time:
             end_time = pysrt.SubRipTime(seconds=group[-1]["end"] + 0.1)
             
-        # Создаем аккуратный короткий кадр субтитров
         item = pysrt.SubRipItem(index=sub_index, start=start_time, end=end_time, text=text_content)
         file.append(item)
         sub_index += 1
@@ -85,7 +78,6 @@ def burn_subtitles(video_in, srt_file, video_out):
     cmd = f'ffmpeg -y -i "{video_in}" -vf "subtitles={srt_filter}:force_style=\'{style}\'" -c:a copy "{video_out}"'
     subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-# --- ИНТЕРФЕЙС ---
 st.set_page_config(page_title="SDVGH Subtitles Generator", layout="centered")
 st.title("Автоматический генератор субтитров")
 st.write("Вычисления запущены на облачных процессорах: **Groq LPU (Whisper Large V3)**")
@@ -109,21 +101,16 @@ if uploaded_file is not None:
         
         with st.spinner("Вытаскиваем звук, отправляем в облако Groq и вжигаем сабы..."):
             try:
-                # 1. Сжимаем и вытаскиваем аудиодорожку
                 extract_audio(input_path, audio_path)
                 
-                # 2. Быстро распознаем через API
                 api_result = query_groq_whisper(audio_path)
                 words = api_result.get("words", [])
                 
-                # Запасной фолбэк, если Groq сгруппировал только по сегментам
                 if not words and "segments" in api_result:
                     words = [{"word": seg.get("text"), "start": seg.get("start"), "end": seg.get("end")} for seg in api_result["segments"]]
                 
-                # 3. Собираем структуру через pysrt
                 make_dynamic_srt(words, srt_path, max_words)
                 
-                # 4. Вжигаем субтитры
                 burn_subtitles(input_path, srt_path, output_path)
                 
                 st.success("Видео успешно обработано!")
