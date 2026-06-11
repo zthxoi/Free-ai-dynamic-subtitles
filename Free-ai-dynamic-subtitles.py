@@ -3,7 +3,9 @@ import os
 import subprocess
 import requests
 import time
-from pysrt import SubRipFile, SubRipEvent, SubRipTime
+from pysrt.srtfile import SubRipFile
+from pysrt.srtevent import SubRipEvent
+from pysrt.srttime import SubRipTime
 
 # Настройки API
 # Используем самую мощную и быструю на сегодня модель whisper-large-v3-turbo
