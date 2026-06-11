@@ -5,7 +5,7 @@ import os
 import subprocess
 import pysrt
 
-MODEL_ID = "openai/whisper-small"
+MODEL_ID = "openai/whisper-base"
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -60,7 +60,7 @@ st.set_page_config(page_title="SDVGH Subtitles Generator", layout="centered")
 st.title("Автоматический генератор субтитров")
 st.write(f"Вычисления запущены на: **{device.upper()}**")
 
-state = {"pipe": load_whisper()}
+pipe = load_whisper()
 
 st.sidebar.header("Настройки субтитров")
 lang = st.sidebar.selectbox("Язык видео", ["russian", "english"])
@@ -84,17 +84,9 @@ if uploaded_file is not None:
             try:
                 extract_audio(input_path, audio_path)
                 
-                if state["pipe"] is None:
-                    state["pipe"] = load_whisper()
-
-                result = state["pipe"](audio_path, return_timestamps="word", generate_kwargs={"language": lang})
+                result = pipe(audio_path, return_timestamps="word", generate_kwargs={"language": lang})
                 
                 make_dynamic_srt(result["chunks"], srt_path, max_words)
-                
-                import gc
-                state["pipe"] = None
-                gc.collect() 
-
                 
                 burn_subtitles(input_path, srt_path, output_path)
                 
@@ -110,11 +102,13 @@ if uploaded_file is not None:
                     )
                     
             except Exception as e:
-                st.error(f"Произошла что-то плохое: {e}")
+                st.error(f"Произошла ошибка обработки: {e}")
                 
             finally:
-                if state["pipe"] is None:
-                    state["pipe"] = load_whisper()
+                for path in [audio_path, srt_path, input_path, output_path]:
+                    if os.path.exists(path):
+                        try: os.remove(path)
+                        except: pass
                     
                 for path in [audio_path, srt_path, input_path, output_path]:
                     if os.path.exists(path):
