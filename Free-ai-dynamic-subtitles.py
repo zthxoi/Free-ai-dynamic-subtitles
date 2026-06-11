@@ -88,6 +88,11 @@ if uploaded_file is not None:
                 
                 make_dynamic_srt(result["chunks"], srt_path, max_words)
                 
+                import gc
+                global pipe
+                del pipe
+                gc.collect() 
+                
                 burn_subtitles(input_path, srt_path, output_path)
                 
                 st.success("Видео успешно обработано!")
@@ -95,16 +100,17 @@ if uploaded_file is not None:
                 
                 with open(output_path, "rb") as file:
                     st.download_button(
-                        label=" Скачать готовое видео",
+                        label="🎬 Скачать готовое видео",
                         data=file,
                         file_name="sdvh_subtitles.mp4",
                         mime="video/mp4"
                     )
                     
             except Exception as e:
-                st.error(f"Произошла что-то плохое: {e}")
+                st.error(f"Произошло что-то плохое: {e}")
                 
             finally:
+                pipe = load_whisper()
                 for path in [audio_path, srt_path, input_path, output_path]:
                     if os.path.exists(path):
                         try: os.remove(path)
