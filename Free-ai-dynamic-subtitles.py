@@ -5,7 +5,7 @@ import os
 import subprocess
 import pysrt
 
-MODEL_ID = "openai/whisper-large-v3-turbo"
+MODEL_ID = "openai/whisper-small"
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
