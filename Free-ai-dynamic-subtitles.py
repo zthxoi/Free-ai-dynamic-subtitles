@@ -51,7 +51,7 @@ def make_dynamic_srt(whisper_chunks, srt_out, max_words):
     file.save(srt_out, encoding='utf-8')
 
 def burn_subtitles(video_in, srt_file, video_out):
-    style = "FontName=Arial,FontSize=26,Bold=1,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=3,Alignment=2"
+    style = "FontName=Arial,FontSize=16,Bold=1,PrimaryColour=&H00FFFF,OutlineColour=&H000000,BorderStyle=1,Outline=3,Alignment=2"
     srt_filter = srt_file.replace(":", "\\:")
     cmd = f'ffmpeg -y -i "{video_in}" -vf "subtitles={srt_filter}:force_style=\'{style}\'" -c:a copy "{video_out}"'
     subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
