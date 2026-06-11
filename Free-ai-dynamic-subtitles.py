@@ -21,24 +21,35 @@ def extract_audio(video_path, audio_path):
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 def query_whisper_api(filename):
-    """Отправляет аудиофайл на сервера Hugging Face и ждет результат"""
+    """Отправляет аудиофайл на сервера Hugging Face с защитой от сбоев сети"""
     with open(filename, "rb") as f:
         data = f.read()
     
-    # Передаем параметры, чтобы сервер вернул нам тайм-коды для каждого слова
     params = {"return_timestamps": "word"}
     
-    # Бесплатный API может спать. Если он просыпается, он вернет ошибку 503.
-    # Делаем цикл, чтобы подождать, пока сервер поднимется
-    for _ in range(10):
-        response = requests.post(API_URL, headers=headers, data=data, params=params)
-        result = response.json()
-        
-        if "error" in result and "currently loading" in result["error"]:
-            time.sleep(5)  # Ждем 5 секунд, если модель еще просыпается
+    # Делаем 5 попыток пробить сеть, если сервер хостинга тупит
+    for attempt in range(1, 6):
+        try:
+            # Добавляем timeout=30, чтобы запрос не зависал намертво
+            response = requests.post(API_URL, headers=headers, data=data, params=params, timeout=30)
+            result = response.json()
+            
+            # Проверяем, не просыпается ли модель
+            if isinstance(result, dict) and "error" in result and "currently loading" in result["error"]:
+                st.warning(f"⏳ Модель Hugging Face просыпается... Ждем (попытка {attempt}/5)")
+                time.sleep(8)
+                continue
+                
+            return result
+            
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as net_err:
+            # Если упал DNS или моргнул интернет на хостинге — не падаем, а ждем и повторяем
+            if attempt == 5:
+                raise Exception(f"Сетевой сбой хостинга после 5 попыток: {net_err}")
+            time.sleep(3)  # Пауза перед следующей попыткой
             continue
-        return result
-    raise Exception("Сервер Hugging Face слишком долго просыпается. Попробуйте еще раз.")
+            
+    raise Exception("Не удалось получить ответ от API.")
 
 def make_dynamic_srt(chunks, srt_path, max_words=2):
     if not chunks:
