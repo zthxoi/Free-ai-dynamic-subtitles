@@ -60,7 +60,7 @@ st.set_page_config(page_title="SDVGH Subtitles Generator", layout="centered")
 st.title("Автоматический генератор субтитров")
 st.write(f"Вычисления запущены на: **{device.upper()}**")
 
-pipe = load_whisper()
+state = {"pipe": load_whisper()}
 
 st.sidebar.header("Настройки субтитров")
 lang = st.sidebar.selectbox("Язык видео", ["russian", "english"])
@@ -76,7 +76,6 @@ if uploaded_file is not None:
     st.video(input_path) 
     
     if st.button("Сгенерировать субтитры"):
-        global pipe  
         audio_path = "user_temp_audio.wav"
         srt_path = "user_subtitles.srt"
         output_path = "user_output_subs.mp4"
@@ -85,13 +84,17 @@ if uploaded_file is not None:
             try:
                 extract_audio(input_path, audio_path)
                 
-                result = pipe(audio_path, return_timestamps="word", generate_kwargs={"language": lang})
+                if state["pipe"] is None:
+                    state["pipe"] = load_whisper()
+
+                result = state["pipe"](audio_path, return_timestamps="word", generate_kwargs={"language": lang})
                 
                 make_dynamic_srt(result["chunks"], srt_path, max_words)
                 
                 import gc
-                del pipe
+                state["pipe"] = None
                 gc.collect() 
+
                 
                 burn_subtitles(input_path, srt_path, output_path)
                 
@@ -107,10 +110,12 @@ if uploaded_file is not None:
                     )
                     
             except Exception as e:
-                st.error(f"Произошло что-то плохое: {e}")
+                st.error(f"Произошла что-то плохое: {e}")
                 
             finally:
-                pipe = load_whisper()
+                if state["pipe"] is None:
+                    state["pipe"] = load_whisper()
+                    
                 for path in [audio_path, srt_path, input_path, output_path]:
                     if os.path.exists(path):
                         try: os.remove(path)
