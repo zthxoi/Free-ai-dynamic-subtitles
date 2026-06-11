@@ -3,9 +3,7 @@ import os
 import subprocess
 import requests
 import time
-from pysrt.srtfile import SubRipFile
-from pysrt.srtevent import SubRipEvent
-from pysrt.srttime import SubRipTime
+import pysrt
 
 # Настройки API
 # Используем самую мощную и быструю на сегодня модель whisper-large-v3-turbo
@@ -44,22 +42,19 @@ def query_whisper_api(filename):
 
 def make_dynamic_srt(chunks, srt_path, max_words=2):
     if not chunks:
-        # Если API вернул упрощенный формат без чанков, создаем один пустой эвент
         return
         
-    srt = SubRipFile()
+    # Создаем пустой объект файла субтитров
+    srt = pysrt.SubRipFile()
     index = 1
     
-    # Группируем слова по max_words штук на экран
     for i in range(0, len(chunks), max_words):
         group = chunks[i:i + max_words]
         
-        # Берем текст группы
         text = " ".join([word_info.get("text", "").strip() for word_info in group])
         if not text:
             continue
             
-        # Пытаемся вытащить тайм-коды начала и конца группы
         try:
             start_time = group[0]["timestamp"][0]
             end_time = group[-1]["timestamp"][1]
@@ -69,12 +64,20 @@ def make_dynamic_srt(chunks, srt_path, max_words=2):
         if start_time is None or end_time is None:
             continue
 
-        # Конвертируем секунды во временной формат SRT
-        start_srt = SubRipTime(milliseconds=int(start_time * 1000))
-        end_srt = SubRipTime(milliseconds=int(end_time * 1000))
+        # Переводим секунды в строковый формат, который pysrt понимает идеально: "ЧЧ:ММ:СС,МММ"
+        def format_time(seconds):
+            hrs = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            msecs = int((seconds - int(seconds)) * 1000)
+            return f"{hrs:02d}:{mins:02d}:{secs:02d},{msecs:03d}"
+
+        # Создаем объект субтитра из обычной текстовой строки формата SRT
+        # Это избавляет нас от необходимости импортировать SubRipEvent и SubRipTime
+        srt_item_text = f"{index}\n{format_time(start_time)} --> {format_time(end_time)}\n{text}\n"
         
-        event = SubRipEvent(index=index, start=start_srt, end=end_srt, text=text)
-        srt.append(event)
+        # Парсим строку в объект и добавляем в файл
+        srt.append(pysrt.SubRipItem.from_string(srt_item_text))
         index += 1
         
     srt.save(srt_path, encoding='utf-8')
